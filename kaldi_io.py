@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License")
 
 import numpy as np
-import os, re, gzip, struct
+import sys, os, re, gzip, struct
 
 #################################################
 # Adding kaldi tools to shell path,
@@ -26,6 +26,7 @@ class UnknownMatrixHeader(Exception): pass
 class BadSampleSize(Exception): pass
 class BadInputFormat(Exception): pass
 
+class SubprocessFailed(Exception): pass
 
 #################################################
 # Data-type independent helper functions,
@@ -45,10 +46,10 @@ def open_or_fd(file, mode='rb'):
       (file,offset) = file.rsplit(':',1)
     # input pipe?
     if file[-1] == '|':
-      fd = os.popen(file[:-1], 'rb')
+      fd = popen(file[:-1], 'rb') # custom,
     # output pipe?
     elif file[0] == '|':
-      fd = os.popen(file[1:], 'wb')
+      fd = popen(file[1:], 'wb') # custom,
     # is it gzipped?
     elif file.split('.')[-1] == 'gz':
       fd = gzip.open(file, mode)
@@ -62,20 +63,57 @@ def open_or_fd(file, mode='rb'):
   if offset != None: fd.seek(int(offset))
   return fd
 
+# based on '/usr/local/lib/python3.4/os.py'
+def popen(cmd, mode="rb"):
+  if not isinstance(cmd, str):
+    raise TypeError("invalid cmd type (%s, expected string)" % type(cmd))
+
+  import subprocess, io, threading
+
+  # cleanup function for subprocesses,
+  def cleanup(proc, cmd):
+    ret = proc.wait()
+    if ret > 0:
+      raise SubprocessFailed('cmd %s returned %d !' % (cmd,ret))
+    return
+
+  # text-mode,
+  if mode == "r":
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    threading.Thread(target=cleanup,args=(proc,cmd)).start() # clean-up thread,
+    return io.TextIOWrapper(proc.stdout)
+  elif mode == "w":
+    proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE)
+    threading.Thread(target=cleanup,args=(proc,cmd)).start() # clean-up thread,
+    return io.TextIOWrapper(proc.stdin)
+  # binary,
+  elif mode == "rb":
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    threading.Thread(target=cleanup,args=(proc,cmd)).start() # clean-up thread,
+    return proc.stdout
+  elif mode == "wb":
+    proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE)
+    threading.Thread(target=cleanup,args=(proc,cmd)).start() # clean-up thread,
+    return proc.stdin
+  # sanity,
+  else:
+    raise ValueError("invalid mode %s" % mode)
+
+
 def read_key(fd):
-  """ [str] = read_key(fd)
+  """ [key] = read_key(fd)
    Read the utterance-key from the opened ark/stream descriptor 'fd'.
   """
-  str = ''
+  key = ''
   while 1:
-    char = fd.read(1)
+    char = fd.read(1).decode()
     if char == '' : break
     if char == ' ' : break
-    str += char
-  str = str.strip()
-  if str == '': return None # end of file,
-  assert(re.match('^[\.a-zA-Z0-9_-]+$',str) != None) # check format,
-  return str
+    key += char
+  key = key.strip()
+  if key == '': return None # end of file,
+  assert(re.match('^[\.a-zA-Z0-9_-]+$',key) != None) # check format,
+  return key
 
 
 #################################################
@@ -108,16 +146,16 @@ def read_vec_int(file_or_fd):
    Read kaldi integer vector, ascii or binary input,
   """
   fd = open_or_fd(file_or_fd)
-  binary = fd.read(2)
+  binary = fd.read(2).decode()
   if binary == '\0B': # binary flag
-    assert(fd.read(1) == '\4'); # int-size
-    vec_size = np.fromfile(fd, dtype='int32', count=1)[0] # vector dim
+    assert(fd.read(1).decode() == '\4'); # int-size
+    vec_size = np.frombuffer(fd.read(4), dtype='int32', count=1)[0] # vector dim
     # Elements from int32 vector are sored in tuples: (sizeof(int32), value),
-    vec = np.fromfile(fd, dtype=[('size','int8'),('value','int32')], count=vec_size)
+    vec = np.frombuffer(fd.read(vec_size*5), dtype=[('size','int8'),('value','int32')], count=vec_size)
     assert(vec[0]['size'] == 4) # int32 size,
     ans = vec[:]['value'] # values are in 2nd column,
   else: # ascii,
-    arr = (binary + fd.readline()).strip().split()
+    arr = (binary + fd.readline().decode()).strip().split()
     try:
       arr.remove('['); arr.remove(']') # optionally
     except ValueError:
@@ -144,15 +182,16 @@ def write_vec_int(file_or_fd, v, key=''):
        kaldi_io.write_vec_flt(f, vec, key=key)
   """
   fd = open_or_fd(file_or_fd, mode='wb')
+  if sys.version_info[0] == 3: assert(fd.mode == 'wb')
   try:
-    if key != '' : fd.write(key+' ') # ark-files have keys (utterance-id),
-    fd.write('\0B') # we write binary!
+    if key != '' : fd.write((key+' ').encode()) # ark-files have keys (utterance-id),
+    fd.write('\0B'.encode()) # we write binary!
     # dim,
-    fd.write('\4') # int32 type,
+    fd.write('\4'.encode()) # int32 type,
     fd.write(struct.pack(np.dtype('int32').char, v.shape[0]))
     # data,
     for i in range(len(v)):
-      fd.write('\4') # int32 type,
+      fd.write('\4'.encode()) # int32 type,
       fd.write(struct.pack(np.dtype('int32').char, v[i])) # binary,
   finally:
     if fd is not file_or_fd : fd.close()
@@ -177,7 +216,7 @@ def read_vec_flt_scp(file_or_fd):
   fd = open_or_fd(file_or_fd)
   try:
     for line in fd:
-      (key,rxfile) = line.split(' ')
+      (key,rxfile) = line.decode().split(' ')
       vec = read_vec_flt(rxfile)
       yield key, vec
   finally:
@@ -206,17 +245,17 @@ def read_vec_flt(file_or_fd):
    Read kaldi float vector, ascii or binary input,
   """
   fd = open_or_fd(file_or_fd)
-  binary = fd.read(2)
+  binary = fd.read(2).decode()
   if binary == '\0B': # binary flag
     # Data type,
-    header = fd.read(3)
+    header = fd.read(3).decode()
     if header == 'FV ': sample_size = 4 # floats
     elif header == 'DV ': sample_size = 8 # doubles
     else: raise UnknownVectorHeader("The header contained '%s'" % header)
     assert(sample_size > 0)
     # Dimension,
-    assert(fd.read(1) == '\4'); # int-size
-    vec_size = np.fromfile(fd, dtype='int32', count=1)[0] # vector dim
+    assert(fd.read(1).decode() == '\4'); # int-size
+    vec_size = np.frombuffer(fd.read(4), dtype='int32', count=1)[0] # vector dim
     # Read whole vector,
     buf = fd.read(vec_size * sample_size)
     if sample_size == 4 : ans = np.frombuffer(buf, dtype='float32')
@@ -224,7 +263,7 @@ def read_vec_flt(file_or_fd):
     else : raise BadSampleSize
     return ans
   else: # ascii,
-    arr = (binary + fd.readline()).strip().split()
+    arr = (binary + fd.readline().decode()).strip().split()
     try:
       arr.remove('['); arr.remove(']') # optionally
     except ValueError:
@@ -251,18 +290,19 @@ def write_vec_flt(file_or_fd, v, key=''):
        kaldi_io.write_vec_flt(f, vec, key=key)
   """
   fd = open_or_fd(file_or_fd, mode='wb')
+  if sys.version_info[0] == 3: assert(fd.mode == 'wb')
   try:
-    if key != '' : fd.write(key+' ') # ark-files have keys (utterance-id),
-    fd.write('\0B') # we write binary!
+    if key != '' : fd.write((key+' ').encode()) # ark-files have keys (utterance-id),
+    fd.write('\0B'.encode()) # we write binary!
     # Data-type,
-    if v.dtype == 'float32': fd.write('FV ')
-    elif v.dtype == 'float64': fd.write('DV ')
+    if v.dtype == 'float32': fd.write('FV '.encode())
+    elif v.dtype == 'float64': fd.write('DV '.encode())
     else: raise UnsupportedDataType("'%s', please use 'float32' or 'float64'" % v.dtype)
     # Dim,
-    fd.write('\04')
+    fd.write('\04'.encode())
     fd.write(struct.pack(np.dtype('uint32').char, v.shape[0])) # dim
     # Data,
-    v.tofile(fd, sep="") # binary
+    fd.write(v.tobytes())
   finally:
     if fd is not file_or_fd : fd.close()
 
@@ -286,7 +326,7 @@ def read_mat_scp(file_or_fd):
   fd = open_or_fd(file_or_fd)
   try:
     for line in fd:
-      (key,rxfile) = line.split(' ')
+      (key,rxfile) = line.decode().split(' ')
       mat = read_mat(rxfile)
       yield key, mat
   finally:
@@ -321,7 +361,7 @@ def read_mat(file_or_fd):
   """
   fd = open_or_fd(file_or_fd)
   try:
-    binary = fd.read(2)
+    binary = fd.read(2).decode()
     if binary == '\0B' :
       mat = _read_mat_binary(fd)
     else:
@@ -333,7 +373,7 @@ def read_mat(file_or_fd):
 
 def _read_mat_binary(fd):
   # Data type
-  header = fd.read(3)
+  header = fd.read(3).decode()
   # 'CM', 'CM2', 'CM3' are possible values,
   if header.startswith('CM'): return _read_compressed_mat(fd, header)
   elif header == 'FM ': sample_size = 4 # floats
@@ -341,7 +381,7 @@ def _read_mat_binary(fd):
   else: raise UnknownMatrixHeader("The header contained '%s'" % header)
   assert(sample_size > 0)
   # Dimensions
-  s1, rows, s2, cols = np.fromfile(fd, dtype='int8,int32,int8,int32', count=1)[0]
+  s1, rows, s2, cols = np.frombuffer(fd.read(10), dtype='int8,int32,int8,int32', count=1)[0]
   # Read whole matrix
   buf = fd.read(rows * cols * sample_size)
   if sample_size == 4 : vec = np.frombuffer(buf, dtype='float32')
@@ -353,7 +393,7 @@ def _read_mat_binary(fd):
 def _read_mat_ascii(fd):
   rows = []
   while 1:
-    line = fd.readline()
+    line = fd.readline().decode()
     if (len(line) == 0) : raise BadInputFormat # eof, should not happen!
     if len(line.strip()) == 0 : continue # skip empty line
     arr = line.strip().split()
@@ -397,12 +437,12 @@ def _read_compressed_mat(fd, format):
     return ans
 
   # Read global header,
-  globmin, globrange, rows, cols = np.fromfile(fd, dtype=global_header, count=1)[0]
+  globmin, globrange, rows, cols = np.frombuffer(fd.read(16), dtype=global_header, count=1)[0]
 
   # The data is structed as [Colheader, ... , Colheader, Data, Data , .... ]
   #                         {           cols           }{     size         }
-  col_headers = np.fromfile(fd, dtype=per_col_header, count=cols)
-  data = np.reshape(np.fromfile(fd, dtype='uint8', count=cols*rows), newshape=(cols,rows)) # stored as col-major,
+  col_headers = np.frombuffer(fd.read(cols*8), dtype=per_col_header, count=cols)
+  data = np.reshape(np.frombuffer(fd.read(cols*rows), dtype='uint8', count=cols*rows), newshape=(cols,rows)) # stored as col-major,
 
   mat = np.empty((cols,rows), dtype='float32')
   for i, col_header in enumerate(col_headers):
@@ -430,20 +470,21 @@ def write_mat(file_or_fd, m, key=''):
        kaldi_io.write_mat(f, mat, key=key)
   """
   fd = open_or_fd(file_or_fd, mode='wb')
+  if sys.version_info[0] == 3: assert(fd.mode == 'wb')
   try:
-    if key != '' : fd.write(key+' ') # ark-files have keys (utterance-id),
-    fd.write('\0B') # we write binary!
+    if key != '' : fd.write((key+' ').encode()) # ark-files have keys (utterance-id),
+    fd.write('\0B'.encode()) # we write binary!
     # Data-type,
-    if m.dtype == 'float32': fd.write('FM ')
-    elif m.dtype == 'float64': fd.write('DM ')
+    if m.dtype == 'float32': fd.write('FM '.encode())
+    elif m.dtype == 'float64': fd.write('DM '.encode())
     else: raise UnsupportedDataType("'%s', please use 'float32' or 'float64'" % v.dtype)
     # Dims,
-    fd.write('\04')
+    fd.write('\04'.encode())
     fd.write(struct.pack(np.dtype('uint32').char, m.shape[0])) # rows
-    fd.write('\04')
+    fd.write('\04'.encode())
     fd.write(struct.pack(np.dtype('uint32').char, m.shape[1])) # cols
     # Data,
-    m.tofile(fd, sep="") # binary
+    fd.write(m.tobytes())
   finally:
     if fd is not file_or_fd : fd.close()
 
@@ -496,15 +537,15 @@ def read_post(file_or_fd):
   """
   fd = open_or_fd(file_or_fd)
   ans=[]
-  binary = fd.read(2); assert(binary == '\0B'); # binary flag
-  assert(fd.read(1) == '\4'); # int-size
-  outer_vec_size = np.fromfile(fd, dtype='int32', count=1)[0] # number of frames (or bins)
+  binary = fd.read(2).decode(); assert(binary == '\0B'); # binary flag
+  assert(fd.read(1).decode() == '\4'); # int-size
+  outer_vec_size = np.frombuffer(fd.read(4), dtype='int32', count=1)[0] # number of frames (or bins)
 
   # Loop over 'outer-vector',
   for i in range(outer_vec_size):
-    assert(fd.read(1) == '\4'); # int-size
-    inner_vec_size = np.fromfile(fd, dtype='int32', count=1)[0] # number of records for frame (or bin)
-    data = np.fromfile(fd, dtype=[('size_idx','int8'),('idx','int32'),('size_post','int8'),('post','float32')], count=inner_vec_size)
+    assert(fd.read(1).decode() == '\4'); # int-size
+    inner_vec_size = np.frombuffer(fd.read(4), dtype='int32', count=1)[0] # number of records for frame (or bin)
+    data = np.frombuffer(fd.read(inner_vec_size*10), dtype=[('size_idx','int8'),('idx','int32'),('size_post','int8'),('post','float32')], count=inner_vec_size)
     assert(data[0]['size_idx'] == 4)
     assert(data[0]['size_post'] == 4)
     ans.append(data[['idx','post']].tolist())
@@ -553,12 +594,12 @@ def read_cntime(file_or_fd):
    Returns vector of tuples.
   """
   fd = open_or_fd(file_or_fd)
-  binary = fd.read(2); assert(binary == '\0B'); # assuming it's binary
+  binary = fd.read(2).decode(); assert(binary == '\0B'); # assuming it's binary
 
-  assert(fd.read(1) == '\4'); # int-size
-  vec_size = np.fromfile(fd, dtype='int32', count=1)[0] # number of frames (or bins)
+  assert(fd.read(1).decode() == '\4'); # int-size
+  vec_size = np.frombuffer(fd.read(4), dtype='int32', count=1)[0] # number of frames (or bins)
 
-  data = np.fromfile(fd, dtype=[('size_beg','int8'),('t_beg','float32'),('size_end','int8'),('t_end','float32')], count=vec_size)
+  data = np.frombuffer(fd.read(vec_size*10), dtype=[('size_beg','int8'),('t_beg','float32'),('size_end','int8'),('t_end','float32')], count=vec_size)
   assert(data[0]['size_beg'] == 4)
   assert(data[0]['size_end'] == 4)
   ans = data[['t_beg','t_end']].tolist() # Return vector of tuples (t_beg,t_end),
